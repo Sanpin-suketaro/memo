@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>超メモ帳（Vanilla JS）</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* ちょい足し */
+    .modal-enter { opacity: 0; transform: scale(.98); }
+    .modal-enter-active { opacity: 1; transform: scale(1); transition: all 120ms ease; }
+    .modal-leave { opacity: 1; }
+    .modal-leave-active { opacity: 0; transition: opacity 120ms ease; }
+    mark { padding: 0 .2em; border-radius: .25rem; }
+  </style>
+</head>
+<body class="bg-slate-50">
+  <div id="app" class="w-full h-[92vh] grid grid-cols-[300px_1fr]"></div>
+
+  <!-- 編集モーダル -->
+  <div id="editModal" class="fixed inset-0 hidden items-center justify-center p-4 z-50 bg-black/30">
+    <div class="w-full max-w-2xl bg-white rounded-2xl p-4 shadow-xl border">
+      <div class="text-lg font-semibold mb-2">メモを編集</div>
+      <textarea id="editTextarea" class="w-full h-48 border rounded-xl p-3"></textarea>
+      <div class="mt-3 flex items-center justify-end gap-2">
+        <button id="btnCancelEdit" class="px-3 py-2 text-sm">キャンセル</button>
+        <button id="btnSaveEdit" class="px-4 py-2 rounded-xl bg-black text-white text-sm">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ============ 小ユーティリティ ============
+    const LS_KEY = "super-memo-pad-v1";
+    const nowIso = () => new Date().toISOString();
+    const uid = () => `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+
+    const escapeHtml = (s) => s
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+
+    const mdBold = (s) => s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+    function formatMDAndHighlight(raw, tokens = []) {
+      let html = mdBold(escapeHtml(raw));
+      if (tokens.length) {
+        const sorted = [...tokens]
+          .filter(Boolean)
+          .map(t => t.trim())
+          .filter(Boolean)
+          .sort((a,b) => b.length - a.length);
+        for (const t of sorted) {
+          const re = new RegExp(`(${t.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")})`, "gi");
+          html = html.replace(re, "<mark>$1</mark>");
+        }
+      }
+      return html.replaceAll("\n", "<br>");
+    }
+
+    const ymd = (d) => {
+      const dt = typeof d === 'string' ? new Date(d) : d;
+      const y = dt.getFullYear();
+      const m = `${dt.getMonth()+1}`.padStart(2,'0');
+      const da = `${dt.getDate()}`.padStart(2,'0');
+      return `${y}-${m}-${da}`;
+    };
+
+    const mdDisp = (d) => {
+      const dt = typeof d === 'string' ? new Date(d) : d;
+      return `${dt.getMonth()+1}/${dt.getDate()}`;
+    };
+
+    const DEFAULT_THESAURUS = [
+      { base: "重要", words: ["大事","優先","要点","要旨"] },
+      { base: "メモ", words: ["ノート","記録","備忘","メモ書き"] },
+      { base: "買う", words: ["購入","買付","取得"] },
+      { base: "売る", words: ["販売","売却"] },
+      { base: "確認", words: ["チェック","検証","見直し"] },
+      { base: "バグ", words: ["不具合","障害","不調"] },
+    ];
+
+    const initialData = {
+      userName: "プロフィール名",
+      lists: [ { id: "inbox", name: "インボックス", color: "#64748b" } ],
+      memos: [], // {id, text, createdAt, updatedAt, pinned, listId}
+      thesaurus: DEFAULT_THESAURUS,
+    };
+
+    // ============ 状態 ============
+    let data;
+    try {
+      const saved = localStorage.getItem(LS_KEY);
+      data = saved ? JSON.parse(saved) : initialData;
+    } catch (e) { data = initialData; }
+
+    // UI 状態
+    let draft = "";
+    let query = "";
+    let useThesaurus = true;
+    let filterListId = "all";
+    let pinnedOnly = false;
+    let dateFrom = "";
+    let dateTo = "";
+
+    let editingId = null; // 現在編集中のメモID
+
+    // 保存
+    function persist() {
+      localStorage.setItem(LS_KEY, JSON.stringify(data));
+    }
+
+    // ============ メモ操作 ============
+    function addMemo() {
+      const text = draft.trim();
+      if (!text) return;
+      const m = {
+        id: uid(),
+        text,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        pinned: false,
+        listId: filterListId === 'all' ? 'inbox' : filterListId,
+      };
+      data.memos.push(m);
+      draft = "";
+      persist();
+      render();
+      // スクロール&フォーカス
+      const scroller = document.getElementById('scroller');
+      scroller?.scrollTo({ top: scroller.scrollHeight });
+      document.getElementById('draftArea')?.focus();
+    }
+
+    function removeMemo(mid) {
+      data.memos = data.memos.filter(m => m.id !== mid);
+      persist(); render();
+    }
+
+    function togglePin(mid) {
+      data.memos = data.memos.map(m => m.id === mid ? { ...m, pinned: !m.pinned } : m);
+      persist(); render();
+    }
+
+    function updateMemo(mid, patch) {
+      data.memos = data.memos.map(m => m.id === mid ? { ...m, ...patch, updatedAt: nowIso() } : m);
+      persist(); render();
+    }
+
+    // ============ リスト操作 ============
+    function addList(name, color) {
+      const nm = (name||'').trim(); if (!nm) return;
+      data.lists.push({ id: uid(), name: nm, color });
+      persist(); render();
+    }
+
+    function removeList(lid) {
+      if (lid === 'inbox') return;
+      data.lists = data.lists.filter(l => l.id !== lid);
+      data.memos = data.memos.map(m => m.listId === lid ? { ...m, listId: 'inbox' } : m);
+      if (filterListId === lid) filterListId = 'all';
+      persist(); render();
+    }
+
+    // ============ 検索フィルタ ============
+    function getQueryTokens() {
+      if (!query.trim()) return [];
+      const tokens = [query.trim()];
+      if (useThesaurus) {
+        const entry = data.thesaurus.find(t => t.base === query.trim() || t.words.includes(query.trim()));
+        if (entry) tokens.push(...entry.words, entry.base);
+      }
+      return Array.from(new Set(tokens));
+    }
+
+    function computeFiltered() {
+      const from = dateFrom ? new Date(dateFrom) : null;
+      const to = dateTo ? new Date(dateTo) : null;
+      const qtokens = getQueryTokens();
+
+      return data.memos
+        .filter(m => (filterListId === 'all' ? true : m.listId === filterListId))
+        .filter(m => (pinnedOnly ? m.pinned : true))
+        .filter(m => {
+          if (!from && !to) return true;
+          const t = new Date(m.createdAt);
+          if (from && t < from) return false;
+          if (to) {
+            const end = new Date(to);
+            end.setDate(end.getDate() + 1);
+            if (t >= end) return false;
+          }
+          return true;
+        })
+        .filter(m => {
+          if (!qtokens.length) return true;
+          const body = m.text;
+          return qtokens.some(tk => body.toLowerCase().includes(tk.toLowerCase()));
+        })
+        .sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+    }
+
+    function groupByDate(items) {
+      const map = new Map();
+      for (const m of items) {
+        const key = ymd(m.createdAt);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(m);
+      }
+      return Array.from(map.entries()).sort((a,b) => new Date(a[0]) - new Date(b[0]));
+    }
+
+    function findList(id) { return data.lists.find(l => l.id === id) || data.lists[0]; }
+
+    // ============ レンダリング ============
+    function render() {
+      // 左サイド
+      const listButtons = `
+        <button data-action="filter-all" class="flex items-center justify-between px-3 py-2 rounded-lg text-sm border ${filterListId==='all'?'bg-slate-100':'bg-white'}">
+          <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-slate-400"></span>すべて</span>
+          <span class="text-slate-500">${data.memos.length}</span>
+        </button>
+        ${data.lists.map(l => `
+          <div class="flex items-center gap-2" data-list-row="${l.id}">
+            <button data-action="filter-list" data-id="${l.id}" class="flex-1 flex items-center justify-between px-3 py-2 rounded-lg text-sm border ${filterListId===l.id?'bg-slate-100':'bg-white'}">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full" style="background:${l.color}"></span>${l.name}
+              </span>
+              <span class="text-slate-500">${data.memos.filter(m=>m.listId===l.id).length}</span>
+            </button>
+            ${l.id!=='inbox' ? `<button data-action="remove-list" data-id="${l.id}" class="px-2 py-2 text-slate-400 hover:text-red-500" title="リスト削除">✕</button>` : ''}
+          </div>
+        `).join('')}
+      `;
+
+      const left = `
+        <aside class="h-full border-r bg-white p-4 flex flex-col gap-4">
+          <div class="flex items-center gap-3">
+            <img src="title.png" alt="超メモ帳" class="h-10 object-contain" />
+          </div>
+          <div class="bg-slate-100 rounded-2xl p-4 flex flex-col items-center gap-3">
+            <div class="w-24 h-24 rounded-full bg-gradient-to-br from-slate-200 to-slate-300 flex items-center justify-center text-4xl">👤</div>
+            <input id="userName" class="text-center text-sm bg-white rounded-md px-2 py-1 w-full border" value="${escapeHtml(data.userName)}" />
+            <div class="text-sm text-slate-600">総メモ数：${data.memos.length}</div>
+            <button id="togglePinnedOnly" class="w-full rounded-xl px-3 py-2 text-sm border flex items-center justify-center gap-2 ${pinnedOnly? 'bg-yellow-50 border-yellow-400':'bg-white'}" title="ピン留めだけ表示">
+              <span>📌 ピン</span>
+              ${pinnedOnly ? '<span class="text-yellow-600">ON</span>' : ''}
+            </button>
+          </div>
+          <div class="flex-1 overflow-auto">
+            <div class="text-xs font-medium text-slate-500 mb-2">リスト</div>
+            <div class="flex flex-col gap-1">${listButtons}</div>
+          </div>
+          <div class="border-t pt-3">
+            <div class="text-xs font-medium text-slate-500 mb-2">新しいリスト</div>
+            <div class="flex items-center gap-2">
+              <input id="newListName" class="flex-1 border rounded-md px-2 py-1 text-sm" placeholder="リスト名" />
+              <input id="newListColor" type="color" class="w-10 h-8 border rounded" value="#22c55e" title="色" />
+              <button id="btnAddList" class="px-3 py-2 rounded-lg border text-sm">追加</button>
+            </div>
+          </div>
+        </aside>
+      `;
+
+      // メイン（検索行）
+      const mainTop = `
+        <div class="p-3 border-b bg-white flex items-center gap-3">
+          <div class="flex items-center gap-2 flex-1 border rounded-xl px-3 py-2 bg-slate-50">
+            <span>🔎</span>
+            <input id="q" value="${escapeHtml(query)}" placeholder="文字を入力して検索" class="flex-1 bg-transparent outline-none text-sm" />
+            <label class="text-xs flex items-center gap-1 select-none">
+              <input id="useThesaurus" type="checkbox" ${useThesaurus? 'checked': ''} /> 類語
+            </label>
+          </div>
+          <div class="flex items-center gap-2 text-xs">
+            <span>日付</span>
+            <input id="dateFrom" type="date" class="border rounded px-2 py-1" value="${dateFrom}" />
+            <span>〜</span>
+            <input id="dateTo" type="date" class="border rounded px-2 py-1" value="${dateTo}" />
+            <button id="btnClear" class="ml-2 text-slate-600 underline">クリア</button>
+          </div>
+        </div>`;
+
+      // メモ一覧
+      const qtokens = getQueryTokens();
+      const grouped = groupByDate(computeFiltered());
+      const memoList = grouped.length === 0
+        ? `<div class="text-center text-slate-400 py-10">メモはありません</div>`
+        : grouped.map(([dateKey, memos]) => `
+          <div class="flex flex-col gap-3">
+            <div class="text-lg font-semibold text-slate-700">${mdDisp(dateKey)}</div>
+            ${memos.map(m => `
+              <div class="flex" data-memo-row="${m.id}">
+                <div class="flex-1">
+                  <div class="rounded-xl bg-white px-4 py-3 border shadow-sm">
+                    <div class="max-w-none text-[15px] leading-7" data-body>${formatMDAndHighlight(m.text, qtokens)}</div>
+                    <div class="mt-2 flex items-center justify-between text-xs text-slate-500">
+                      <div class="flex items-center gap-2">
+                        <span class="inline-flex items-center gap-2 text-xs px-2 py-1 rounded-full border" title="${findList(m.listId).name}" style="border-color:${findList(m.listId).color};color:${findList(m.listId).color}">
+                          <span class="w-2 h-2 rounded-full" style="background:${findList(m.listId).color}"></span>${findList(m.listId).name}
+                        </span>
+                        <span>${new Date(m.createdAt).toLocaleString()}</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <button data-action="pin" data-id="${m.id}" class="px-2 py-1 rounded-md border ${m.pinned? 'bg-yellow-50 border-yellow-400':'bg-white'}" title="ピン留め">📌</button>
+                        <select data-action="move" data-id="${m.id}" class="border rounded-md px-2 py-1">
+                          ${data.lists.map(l => `<option value="${l.id}" ${l.id===m.listId?'selected':''}>${l.name}</option>`).join('')}
+                        </select>
+                        <button data-action="edit" data-id="${m.id}" class="px-2 py-1 rounded-md border">編集</button>
+                        <button data-action="remove" data-id="${m.id}" class="px-2 py-1 rounded-md border text-red-600">削除</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        `).join('');
+
+      const mainMiddle = `<div id="scroller" class="overflow-auto p-4 flex flex-col gap-4 bg-slate-50">${memoList}<div></div></div>`;
+
+      // 入力欄
+      const addTarget = filterListId === 'all' ? 'inbox' : filterListId;
+      const mainBottom = `
+        <div class="border-t bg-white p-3">
+          <div class="rounded-2xl border bg-slate-50 p-2">
+            <textarea id="draftArea" class="w-full h-24 resize-none bg-transparent outline-none px-3 py-2" placeholder="テキストを入力\n範囲を選択して win[ctrl+B] / mac[cmd+B] で太字にする">${escapeHtml(draft)}</textarea>
+            <div class="flex items-center justify-between px-2 pb-2">
+              <div class="text-xs text-slate-500">**太字** / Ctrl(Cmd)+Enterで追加</div>
+              <div class="flex gap-2">
+                <select id="addListSelect" class="border rounded-md px-2 py-1 text-sm" title="追加先リスト">
+                  ${data.lists.map(l => `<option value="${l.id}" ${l.id===addTarget?'selected':''}>${l.name}</option>`).join('')}
+                </select>
+                <button id="btnAddMemo" class="rounded-xl bg-black text-white px-4 py-2 text-sm" title="メモを追加">追加</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+
+      document.getElementById('app').innerHTML = `
+        ${left}
+        <main class="h-full grid grid-rows-[auto_1fr_auto]">${mainTop}${mainMiddle}${mainBottom}</main>
+      `;
+
+      // ===== イベント束ね =====
+      // プロフィール名
+      document.getElementById('userName').addEventListener('input', (e) => {
+        data.userName = e.target.value;
+        persist();
+      });
+      // ピンON/OFF表示
+      document.getElementById('togglePinnedOnly').addEventListener('click', () => { pinnedOnly = !pinnedOnly; render(); });
+
+      // リスト関連
+      document.querySelectorAll('[data-action="filter-all"]').forEach(el => el.addEventListener('click', () => { filterListId='all'; render(); }));
+      document.querySelectorAll('[data-action="filter-list"]').forEach(el => el.addEventListener('click', (e) => { filterListId = e.currentTarget.dataset.id; render(); }));
+      document.querySelectorAll('[data-action="remove-list"]').forEach(el => el.addEventListener('click', (e) => { removeList(e.currentTarget.dataset.id); }));
+
+      // 新規リスト
+      document.getElementById('btnAddList').addEventListener('click', () => {
+        const name = document.getElementById('newListName').value;
+        const color = document.getElementById('newListColor').value;
+        addList(name, color);
+        document.getElementById('newListName').value = '';
+      });
+
+      // 検索
+      document.getElementById('q').addEventListener('input', (e) => { query = e.target.value; render(); });
+      document.getElementById('useThesaurus').addEventListener('change', (e) => { useThesaurus = e.target.checked; render(); });
+      document.getElementById('dateFrom').addEventListener('change', (e) => { dateFrom = e.target.value; render(); });
+      document.getElementById('dateTo').addEventListener('change', (e) => { dateTo = e.target.value; render(); });
+      document.getElementById('btnClear').addEventListener('click', () => { query=''; dateFrom=''; dateTo=''; render(); });
+
+      // メモのボタン（委譲）
+      document.getElementById('scroller').addEventListener('click', (e) => {
+        const t = e.target.closest('[data-action]');
+        if (!t) return;
+        const id = t.dataset.id;
+        const action = t.dataset.action;
+        if (action === 'pin') togglePin(id);
+        if (action === 'remove') removeMemo(id);
+        if (action === 'edit') openEdit(id);
+      });
+      // セレクト移動（委譲）
+      document.getElementById('scroller').addEventListener('change', (e) => {
+        const t = e.target;
+        if (t.matches('[data-action="move"]')) {
+          updateMemo(t.dataset.id, { listId: t.value });
+        }
+      });
+
+      // 追加先選択
+      document.getElementById('addListSelect').addEventListener('change', (e) => {
+        filterListId = e.target.value; render();
+      });
+
+      // 追加ボタン
+      document.getElementById('btnAddMemo').addEventListener('click', addMemo);
+
+      // 入力欄キー操作
+      const draftArea = document.getElementById('draftArea');
+      draftArea.addEventListener('input', (e) => { draft = e.target.value; });
+      draftArea.addEventListener('keydown', (e) => {
+        const isB = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b';
+        if (isB) {
+          e.preventDefault();
+          const el = e.target;
+          const start = el.selectionStart; const end = el.selectionEnd;
+          const sel = draft.slice(start, end);
+          const wrapped = `**${sel || '強調'}**`;
+          const next = draft.slice(0,start) + wrapped + draft.slice(end);
+          draft = next; el.value = next;
+          setTimeout(() => el.setSelectionRange(start+2, start+2 + (sel || '強調').length), 0);
+        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+          e.preventDefault(); addMemo();
+        }
+      });
+    }
+
+    // ============ 編集モーダル ============
+    function openEdit(mid) {
+      editingId = mid;
+      const m = data.memos.find(x => x.id === mid);
+      const modal = document.getElementById('editModal');
+      const ta = document.getElementById('editTextarea');
+      ta.value = m?.text || '';
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+      ta.focus();
+    }
+
+    function closeEdit() {
+      const modal = document.getElementById('editModal');
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+      editingId = null;
+    }
+
+    document.getElementById('btnCancelEdit').addEventListener('click', closeEdit);
+    document.getElementById('btnSaveEdit').addEventListener('click', () => {
+      const val = document.getElementById('editTextarea').value;
+      if (editingId) updateMemo(editingId, { text: val });
+      closeEdit();
+    });
+
+    document.getElementById('editTextarea').addEventListener('keydown', (e) => {
+      const isB = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b';
+      if (isB) {
+        e.preventDefault();
+        const el = e.target; const val = el.value;
+        const start = el.selectionStart; const end = el.selectionEnd;
+        const sel = val.slice(start, end);
+        const wrapped = `**${sel || '強調'}**`;
+        const next = val.slice(0,start) + wrapped + val.slice(end);
+        el.value = next; setTimeout(()=> el.setSelectionRange(start+2, start+2 + (sel || '強調').length), 0);
+      }
+    });
+
+    // 初期描画
+    render();
+  </script>
+</body>
+</html>
